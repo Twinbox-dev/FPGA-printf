@@ -1,53 +1,41 @@
 //=============================================================================
-// dbg_printf - 共享调试打印模块 (单实例, 双接口)
+// dbg_printf - 极简调试打印模块
 //
-// 顶层例化一次, 所有需要打印的业务逻辑共享此模块:
+// 顶层例化:
+//   dbg_printf #(.FMT_STR("pc=%x\r\n"), .FMT_LEN(7))
+//   u_dbg (.clk, .rst_n, .write(pc), .tx(uart_tx));
 //
-//   dbg_printf #(.FMT_STR("my_reg=%x\r\n"), .FMT_LEN(12))
-//   u_dbg (.clk, .rst_n, .tx(uart_tx),
-//          .fmt_trig(my_trig), .fmt_val(some_val), .fmt_busy(),
-//          .push_en(), .push_data(), .push_full());
+// 业务逻辑只需:
+//   write <= some_value;   // 模块自动检测变化, 格式化后串行发出
+// 无需握手, 无需关注底层什么时候发完.
 //
-// 【接口 A - 自动格式化 (推荐)】
-//   业务逻辑只管给 fmt_val + 脉冲 fmt_trig, 模块按 FMT_STR 模板
-//   自动做 hex/dec/bin 转换并推送 FIFO, busy 期间忽略新触发.
-//
-// 【接口 B - 逐字节直写】
-//   需要推固定字符串时使用, push_en/push_data 直通内部 FIFO.
-//   当 fmt_busy 或 fifo_full 时 push_full=1, 业务需等待.
+// 模块内部:
+//   ① 空闲时检查 write 与上次打印值 last_printed 是否不同
+//   ② 不同则锁存新值, 按 FMT_STR 模板做格式转换
+//   ③ 字节写入内部 FIFO → UART TX 串行发出
+//   ④ 格式转换期间 write 再变 → 不会丢失, 当前帧发完后回空闲重新检测
 //
 // Parameters:
 //   CLK_FREQ  : 时钟频率
 //   BAUD_RATE : 波特率
-//   FMT_STR   : 格式模板, 如 "reg=%x\r\n"
+//   FMT_STR   : 格式模板, 如 "pc=%x\r\n"
 //   FMT_LEN   : 模板字符数
-//   VAL_WIDTH : fmt_val 位宽
+//   VAL_WIDTH : write 位宽 (默认 32)
 //
-// 占位符: %x(hex), %d(dec), %b(bin), %%(%)
+// 占位符: %x(hex, 全位宽), %d(dec, 抑制前导零), %b(bin), %%(%)
 //=============================================================================
 
 module dbg_printf #(
     parameter CLK_FREQ  = 50_000_000,
     parameter BAUD_RATE = 1_000_000,
-    parameter FMT_STR   = "dbg=%x\r\n",
-    parameter FMT_LEN   = 8,
+    parameter FMT_STR   = "write=%x\r\n",
+    parameter FMT_LEN   = 10,
     parameter VAL_WIDTH = 32
 )(
-    input  clk,
-    input  rst_n,
-
-    // 接口 A: 自动格式化
-    input             fmt_trig,
-    input  [VAL_WIDTH-1:0] fmt_val,
-    output reg        fmt_busy,
-
-    // 接口 B: 逐字节直写 (fmt_busy=0 时才可推入)
-    input  [7:0]      push_data,
-    input             push_en,
-    output            push_full,
-
-    // UART
-    output            tx
+    input                     clk,
+    input                     rst_n,
+    input  [VAL_WIDTH-1:0]    write,
+    output                    tx
 );
 
 //============================================================================
@@ -73,16 +61,6 @@ module dbg_printf #(
     );
 
 //============================================================================
-// 仲裁: 格式化器忙时让格式化器写 FIFO, 否则让外部直写
-//============================================================================
-    reg        fmt_wr_en;
-    reg [7:0]  fmt_data;
-
-    assign push_full = fifo_full | fmt_busy;
-    assign wr_en_int = fmt_busy ? fmt_wr_en : (push_en | fmt_wr_en);
-    assign data_int  = fmt_busy ? fmt_data  : (fmt_wr_en ? fmt_data : push_data);
-
-//============================================================================
 // 常量 & 内部寄存器
 //============================================================================
     localparam NIBBLES    = (VAL_WIDTH + 3) / 4;
@@ -92,19 +70,17 @@ module dbg_printf #(
     localparam CONV_DEC = 2'd1;
     localparam CONV_BIN = 2'd2;
 
-    reg trigger_d;
-    wire trigger_rise = fmt_trig && !trigger_d;
-
     reg [1:0] state;
     localparam S_IDLE = 2'd0;
     localparam S_SEND = 2'd1;
     localparam S_DONE = 2'd2;
 
-    reg [31:0]  fmt_idx;
-    reg [31:0]  val_latched;
-    reg         in_conv;
-    reg [1:0]   conv_type;
-    reg [5:0]   conv_cnt;
+    reg [VAL_WIDTH-1:0] last_printed;
+    reg [31:0]          val_latched;
+    reg [31:0]          fmt_idx;
+    reg                 in_conv;
+    reg [1:0]           conv_type;
+    reg [5:0]           conv_cnt;
 
     reg [39:0]  bcd_buf;
     reg [5:0]   dec_shift;
@@ -156,15 +132,13 @@ module dbg_printf #(
     endfunction
 
 //============================================================================
-// 主状态机
+// 主状态机 (单 always, 无多驱动)
 //============================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state        <= S_IDLE;
-            fmt_busy     <= 0;
-            fmt_wr_en    <= 0;
-            fmt_data     <= 8'h00;
-            trigger_d    <= 0;
+            wr_en_int    <= 0;
+            data_int     <= 8'h00;
             fmt_idx      <= 0;
             val_latched  <= 0;
             in_conv      <= 0;
@@ -174,38 +148,41 @@ module dbg_printf #(
             dec_shift    <= 0;
             dec_sig      <= 0;
             dec_done     <= 0;
+            last_printed <= 0;
         end else begin
-            trigger_d <= fmt_trig;
-            fmt_wr_en <= 0;
+            wr_en_int <= 0;
 
             case (state)
+                // ═══════════ IDLE: 空闲检测 write 变化 ═══════════
                 S_IDLE: begin
-                    fmt_busy <= 0;
-                    if (trigger_rise) begin
-                        val_latched <= fmt_val;
-                        fmt_idx     <= 0;
-                        in_conv     <= 0;
-                        dec_shift   <= 0;
-                        bcd_buf     <= 0;
-                        dec_done    <= 0;
-                        state       <= S_SEND;
-                        fmt_busy    <= 1;
+                    if (write != last_printed) begin
+                        val_latched  <= write;
+                        last_printed <= write;
+                        fmt_idx      <= 0;
+                        in_conv      <= 0;
+                        dec_shift    <= 0;
+                        bcd_buf      <= 0;
+                        dec_done     <= 0;
+                        state        <= S_SEND;
                     end
                 end
 
+                // ═══════════ SEND: 按格式串逐字节写入 FIFO ═══════════
                 S_SEND: begin
                     if (fifo_full) begin
+                        // FIFO 已满, 等待
                     end else if (in_conv) begin
+                        // -- 正在输出格式转换的字节 --
                         case (conv_type)
                             CONV_HEX, CONV_BIN: begin
                                 if (conv_cnt > 0) begin
-                                    fmt_wr_en <= 1;
+                                    wr_en_int <= 1;
                                     conv_cnt  <= conv_cnt - 1;
                                     if (conv_type == CONV_HEX)
-                                        fmt_data <= nibble_ascii(
+                                        data_int <= nibble_ascii(
                                             val_latched[(conv_cnt-1)*4 +: 4]);
                                     else
-                                        fmt_data <= val_latched[conv_cnt-1] ?
+                                        data_int <= val_latched[conv_cnt-1] ?
                                             8'h31 : 8'h30;
                                 end else begin
                                     in_conv <= 0;
@@ -214,6 +191,7 @@ module dbg_printf #(
 
                             CONV_DEC: begin
                                 if (!dec_done) begin
+                                    // 双倍 dabble 转换
                                     if (dec_shift < VAL_WIDTH) begin
                                         bcd_buf   <= {bcd_adjust(bcd_buf)[38:0],
                                                       val_latched[VAL_WIDTH-1 - dec_shift]};
@@ -223,8 +201,8 @@ module dbg_printf #(
                                         dec_sig  <= count_sig_digits(bcd_buf);
                                     end
                                 end else if (dec_sig > 0) begin
-                                    fmt_wr_en <= 1;
-                                    fmt_data  <= "0" + bcd_buf[(dec_sig-1)*4 +: 4];
+                                    wr_en_int <= 1;
+                                    data_int  <= "0" + bcd_buf[(dec_sig-1)*4 +: 4];
                                     dec_sig   <= dec_sig - 1;
                                 end else begin
                                     in_conv <= 0;
@@ -233,6 +211,7 @@ module dbg_printf #(
                         endcase
 
                     end else begin
+                        // -- 正常解析格式串 --
                         if (fmt_idx >= FMT_LEN) begin
                             state <= S_DONE;
                         end else if (fmt_byte(fmt_idx) == "%" &&
@@ -260,27 +239,27 @@ module dbg_printf #(
                                     fmt_idx   <= fmt_idx + 2;
                                 end
                                 "%": begin
-                                    fmt_wr_en <= 1;
-                                    fmt_data  <= "%";
+                                    wr_en_int <= 1;
+                                    data_int  <= "%";
                                     fmt_idx   <= fmt_idx + 2;
                                 end
                                 default: begin
-                                    fmt_wr_en <= 1;
-                                    fmt_data  <= fmt_byte(fmt_idx);
+                                    wr_en_int <= 1;
+                                    data_int  <= fmt_byte(fmt_idx);
                                     fmt_idx   <= fmt_idx + 1;
                                 end
                             endcase
                         end else begin
-                            fmt_wr_en <= 1;
-                            fmt_data  <= fmt_byte(fmt_idx);
+                            wr_en_int <= 1;
+                            data_int  <= fmt_byte(fmt_idx);
                             fmt_idx   <= fmt_idx + 1;
                         end
                     end
                 end
 
+                // ═══════════ DONE: 转回 IDLE, 自动重检 write ═══════════
                 S_DONE: begin
-                    fmt_busy <= 0;
-                    state    <= S_IDLE;
+                    state <= S_IDLE;
                 end
             endcase
         end
