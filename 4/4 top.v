@@ -1,55 +1,55 @@
+// 演示: 单实例 dbg_printf, 多个业务逻辑共享
+// 业务只管给值 + trigger, 模块自动格式化推入 FIFO 并串行发出
 module top (
     input  clk,
     input  rst_n,
     output uart_tx
 );
 
-    reg        wr_en;
-    reg  [7:0] data_in;
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 例化一次 (单 TX 引脚)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    wire        dbg_busy;
+    reg         dbg_trig;
+    reg  [31:0] dbg_val;
 
-    // "Hello World!\r\n"
-    localparam STR_LEN = 14;
-    reg [7:0] str [0:STR_LEN-1];
-    initial begin
-        str[0]  = "H";   str[1]  = "e";  str[2]  = "l";  str[3]  = "l";
-        str[4]  = "o";   str[5]  = " ";  str[6]  = "W";  str[7]  = "o";
-        str[8]  = "r";   str[9]  = "l";  str[10] = "d";  str[11] = "!";
-        str[12] = 8'h0D; str[13] = 8'h0A;
-    end
+    dbg_printf #(
+        .FMT_STR ("cnt=%x\r\n"),
+        .FMT_LEN (8)
+    ) u_dbg (
+        .clk(clk),
+        .rst_n(rst_n),
+        .tx(uart_tx),
 
-    reg [3:0] idx;
-    reg       done;
+        .fmt_trig(dbg_trig),
+        .fmt_val (dbg_val),
+        .fmt_busy(dbg_busy),
+
+        .push_en (1'b0),
+        .push_data(8'h00),
+        .push_full()
+    );
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 业务逻辑: 只管提供要打印的值
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    reg [31:0] cnt;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            wr_en   <= 1'b0;
-            data_in <= 8'h00;
-            idx     <= 4'd0;
-            done    <= 1'b0;
-        end else if (!done) begin
-            wr_en   <= 1'b1;
-            data_in <= str[idx];
-            if (idx == STR_LEN - 1)
-                done <= 1'b1;
-            else
-                idx  <= idx + 1'b1;
+            cnt     <= 0;
+            dbg_trig <= 0;
+            dbg_val <= 0;
         end else begin
-            wr_en <= 1'b0;
+            cnt <= cnt + 1;
+            dbg_trig <= 0;
+
+            if (cnt == 100_000 && !dbg_busy) begin
+                dbg_val  <= cnt;
+                dbg_trig <= 1;
+                cnt      <= 0;
+            end
         end
     end
-
-    write #(
-        .CLK_FREQ  (50_000_000),
-        .BAUD_RATE (1_000_000),
-        .DATA_WIDTH(8),
-        .FIFO_DEPTH(1024)
-    ) u_write (
-        .clk    (clk),
-        .rst_n  (rst_n),
-        .wr_en  (wr_en),
-        .data_in(data_in),
-        .full   (),
-        .empty  (),
-        .tx     (uart_tx)
-    );
 
 endmodule
