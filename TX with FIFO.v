@@ -1,7 +1,7 @@
 //=============================================================================
-// Module Name : printf
-// Description : UART 发送模块，支持运行时字节写入并通过串口异步发送。
-//               使用 FIFO 缓冲写入数据，解耦上层数据产生与串口发送时序。
+// Module Name : write
+// Description : UART 发送模块（含 FIFO 缓冲），自动检测 data_in 变化并写入 FIFO，
+//               通过串口异步发送。解耦上层数据产生与串口发送时序。
 //               串口数据帧格式：1位起始位 + 8位数据位（LSB First）+ 1位停止位。
 //
 // Parameters:
@@ -14,48 +14,49 @@
 //   // 顶层信号
 //   reg        clk;
 //   reg        rst_n;
-//   reg        wr_en;
 //   reg  [7:0] data_in;
-//   wire       fifo_full;
-//   wire       fifo_empty;
 //   wire       tx;
+//   wire       full;
+//   wire       empty;
 //
-//   // 实例化 printf
-//   printf #(
+//   // 实例化 write
+//   write #(
 //       .CLK_FREQ(50_000_000),
 //       .BAUD_RATE(1_000_000),
 //       .DATA_WIDTH(8),
 //       .FIFO_DEPTH(1024)
-//   ) u_printf (
+//   ) u_write (
 //       .clk(clk),
 //       .rst_n(rst_n),
-//       .wr_en(wr_en),
 //       .data_in(data_in),
-//       .full(fifo_full),
-//       .empty(fifo_empty),
+//       .full(full),
+//       .empty(empty),
 //       .tx(tx)
 //   );
 //
-//   // 外部写入示例：只在 FIFO 未满时写入一个字节
+//   // 写入示例：改变 data_in 即可自动触发写入
 //   always @(posedge clk or negedge rst_n) begin
 //       if (!rst_n) begin
-//           wr_en <= 1'b0;
-//           data_in <= 8'h00;
-//       end else if (!fifo_full) begin
-//           wr_en <= 1'b1;
-//           data_in <= 8'h41; // 发送 'A'
+//           data_in <= 8'h41; // 复位后第一个非 0xFF 的值即触发写入
 //       end else begin
-//           wr_en <= 1'b0;
+//           data_in <= 8'h42;
 //       end
 //   end
 //
 // Notes:
-//   - 外部写使能 wr_en 只在 data_in 有效时置 1 一个时钟周期。
+//   - 模块自动检测 data_in 变化并写入 FIFO，无需外部 wr_en。
+//   - 当 FIFO 满时数据不会写入，等待 FIFO 空闲后自动写入最新值。
 //   - tx 输出 UART 串行数据流。
+//
+// TODO(v2.0+):
+//   1. 实现带控制位的 write 模块：通过控制位动态调整写入数据位宽
+//   2. 底层多 FIFO 协调：
+//      - Priority FIFO（优先队列）：向业务保证写入的数据绝对发出
+//      - Normal  FIFO（普通队列）：即当前实现，fifo 静默满，不保证数据发出
 //
 // Author     : [Boxchan]
 // Date       : [2026-06-22_22-41-39]
-// Version    : 4.0
+// Version    : V2.0
 //=============================================================================
 
 
@@ -75,14 +76,13 @@ module write #(
     output reg  tx,
 
     // 用户接口 - 写数据
-    input  [DATA_WIDTH-1:0] data_in,    // 输入数据
-    input  wr_en,                       // 写使能信号
+    input  [DATA_WIDTH-1:0] data_in,    // 输入数据（变化时自动写入 FIFO）
     output full,                        // FIFO满标志
     output empty                        // FIFO空标志
 );
 
 //============= 实例化FIFO ================
-    wire [7:0] fifo_rd_data;
+    wire [DATA_WIDTH-1:0] fifo_rd_data;
     wire fifo_empty;
     wire fifo_full;
     sync_fifo #(
@@ -91,8 +91,8 @@ module write #(
     ) u_fifo (
         .clk(clk),
         .rst_n(rst_n),
-        .wr_en(wr_en),
-        .wr_data(data_in),
+        .wr_en(fifo_wr_en),
+        .wr_data(fifo_wr_data),
         .full(fifo_full),
         .rd_en(rd_en_int),   // 内部读使能
         .rd_data(fifo_rd_data),
@@ -117,7 +117,26 @@ module write #(
     reg [ 2:0] bit_in_byte;
     reg [ 7:0] current_byte;
     reg        rd_en_int;
-    
+    reg                    fifo_wr_en;
+    reg  [DATA_WIDTH-1:0]  fifo_wr_data;
+
+    // 自动检测 data_in 变化并写入 FIFO：
+    // fifo_wr_data 复位为全 1，确保首个 data_in 不论为何值都触发写入；
+    // 同时 fifo_wr_data 追踪上次写入值，避免重复写入相同数据。
+    // fifo_wr_en 在下一周期生效时，FIFO 写的是已锁存的 fifo_wr_data，不受 data_in 变化影响。
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            fifo_wr_en   <= 0;
+            fifo_wr_data <= {DATA_WIDTH{1'b1}};
+        end else begin
+            fifo_wr_en <= 0;
+            if (fifo_wr_data != data_in && !fifo_full) begin
+                fifo_wr_en   <= 1;
+                fifo_wr_data <= data_in;
+            end
+        end
+    end
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             bit_in_byte <= 0;
@@ -160,7 +179,7 @@ module write #(
                         state <= BYTE;
                     end
                 end
-                
+
                 BYTE: begin
                     // 从当前字节的最低位开始发送。UART协议要求发送数据时，LSB优先(即逆序发送)。
                     tx <= current_byte[bit_in_byte];
@@ -175,7 +194,7 @@ module write #(
                         end
                     end
                 end
-                
+
                 BYTE_END: begin
                     tx <= 1;
                     if (baud_cnt < BAUD_DIV - 1) begin
