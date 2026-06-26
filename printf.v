@@ -41,13 +41,15 @@ module printf #(
     input  [MSG_WIDTH-1:0] data_in
 ); 
 
-// 目前决定最高位[7]表示是否写入priority FIFO + [1:0] 表示数据位宽8/16/32/64从高到低供选择 + [6]表示瞬间清空cache FIFO(很危险但个人觉得有必要) + 其他位置暂时保留
+// 目前决定最高位[7]表示是否写入priority FIFO + [2:0]表示字有效(控制8个byte) + [6]表示瞬间清空cache FIFO(很危险但个人觉得有必要) + 其他位置暂时保留
 wire [7:0]  ctrl; 
 wire [63:0] data;
 assign ctrl = data_in[71:64];
 assign data = data_in[63:0];
 
 
+reg [ 1:0] wr_en;
+reg [DATA_WIDTH-1:0] wr_data;
 
 
 //============= 实例化FIFO ================
@@ -57,7 +59,6 @@ assign data = data_in[63:0];
     wire fifo_empty;
     wire fifo_full;
     wire cache_write_en;
-
     sync_fifo #(
         .DATA_WIDTH(MSG_WIDTH),
         .FIFO_DEPTH(FIFO_DEPTH)
@@ -82,7 +83,6 @@ assign data = data_in[63:0];
     wire [custom_data_width-1:0] custom_write_data;
     wire custom_write_en;
     wire cutsom_fifo_empty,custom_fifo_full;
-
     sync_fifo #(
         .DATA_WIDTH(custom_data_width),
         .FIFO_DEPTH(custom_fifo_depth)
@@ -97,13 +97,12 @@ assign data = data_in[63:0];
         .empty(custom_fifo_empty)
     );
 
-
 // 优先级FIFO
     `define priority_data_width 64
     `define priority_fifo_depth 64
     wire [priority_data_width-1:0] priotiry_read_data;
     wire [priority_data_width-1:0] priority_write_data;
-    wire priority_write_en;
+    wire priority_write_en,priority_empty,priority_read_en;
     sync_fifo #(
         .DATA_WIDTH(priority_data_width),
         .FIFO_DEPTH(priority_fifo_depth)
@@ -112,18 +111,14 @@ assign data = data_in[63:0];
         .rst_n(rst_n),
         .wr_en(priority_write_en),
         .wr_data(priority_write_data),
-        .rd_en(rd_en_int),
+        .rd_en(priority_read_en),
         .rd_data(priority_read_data),
         .full(),
-        .empty()
+        .empty(priority_empty)
     );
     assign priority_write_en    = wr_en[1];
     assign priority_write_data  = wr_data[priority_data_width-1:0];
 //========================================
-
-
-    reg [ 1:0] wr_en;
-    reg [DATA_WIDTH-1:0] wr_data;
 
     // 自动检测 data_in 变化并写入 FIFO：
     always @(posedge clk or negedge rst_n) begin
@@ -142,24 +137,6 @@ assign data = data_in[63:0];
 
     wire [DATA_WIDTH-1:0] cache;
     assign cache = wr_data;
-
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        state <= WAIT_READ;
-        rd_en_int <= 0;
-    end else begin
-        case (state)
-            WAIT_READ: begin
-                rd_en_int <= 0;
-                state <= START_READ;
-            end
-
-            START_READ: begin
-                rd_en_int <= 0;
-                current_byte <= fifo_rd_data;
-                state <= BYTE_BEGIN;
-            end
 
 
 //============= 实例化write ===============
@@ -186,6 +163,22 @@ always @(posedge clk or negedge rst_n) begin
 
 
 
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        state <= WAIT_READ;
+        rd_en_int <= 0;
+    end else begin
+        case (state)
+            WAIT_READ: begin
+                rd_en_int <= 0;
+                state <= START_READ;
+            end
+
+            START_READ: begin
+                rd_en_int <= 0;
+                current_byte <= fifo_rd_data;
+                state <= BYTE_BEGIN;
+            end
 
 
 //============================================================================
@@ -193,18 +186,15 @@ always @(posedge clk or negedge rst_n) begin
 //============================================================================
     reg [2:0]   tx_state;
     reg [66:0]  tx_entry;      // 当前发送的 entry
-    reg [3:0]   tx_byte_cnt;   // 数据字节总数 (1/2/4/8)
+    reg [3:0]   tx_byte_cnt;   
     reg [3:0]   tx_byte_idx;   // 当前数据字节索引
 
-    localparam TX_IDLE = 3'd0;
+    localparam TX_IDLE = 3'd0;  
     localparam TX_WAIT = 3'd1;
     localparam TX_LOAD = 3'd2;
     localparam TX_HEAD = 3'd3;
     localparam TX_DATA = 3'd4;
     localparam TX_TAIL = 3'd5;
-
-    
-
 
     wire [66:0] fifo_rd_data = prio_rd_data | main_rd_data;
 
@@ -286,7 +276,3 @@ always @(posedge clk or negedge rst_n) begin
 endmodule
 
 
-
-
-
-endmodule
