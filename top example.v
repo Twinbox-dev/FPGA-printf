@@ -2,6 +2,13 @@
 // data_in[71:64] = ctrl: [7]=prio(0) [6]=clear(0) [2:0]=byte_cnt-1(0=1byte)
 // data_in[63:0]  = data: byte0=0xAB
 
+// todo: 添加语法糖 - 宏版本
+// `define printf_byte(D)   data_in <= {8'd0, 56'h0, D}
+// `printf_byte(8'hAB);
+// `define printf_word(D)   data_in <= {8'd1, 48'h0, D}
+// `printf_word(cnt);
+
+
 module top (
     input  clk,
     input  rst_n,
