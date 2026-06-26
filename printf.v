@@ -328,12 +328,15 @@ assign data = data_in[63:0];
     localparam TX_IDLE             = 3'd0;
     localparam TX_PRIO_READ        = 3'd1;
     localparam TX_PRIO_SEND        = 3'd2;
-    localparam TX_CUSTOM_READ_SEND = 3'd4;
+    localparam TX_CUSTOM_READ      = 3'd4;
+    localparam TX_CUSTOM_SEND      = 3'd5;
+
 
     reg [2:0] byte_idx;
     reg [7:0] uart_byte;
     reg tx_wait_cnt;
     reg [7:0] priority_data_temp [0:7]; // 反着接正向字节
+    reg [7:0] custom_data_temp;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -356,7 +359,7 @@ assign data = data_in[63:0];
                         tx_state <= TX_PRIO_READ;
                     end else if (!custom_empty) begin
                         custom_read_en <= 1;
-                        tx_state <= TX_CUSTOM_READ_SEND;
+                        tx_state <= TX_CUSTOM_READ;
                     end
                 end
 
@@ -389,13 +392,20 @@ assign data = data_in[63:0];
                     end
                 end
 
-                TX_CUSTOM_READ_SEND: begin
+                TX_CUSTOM_READ: begin
                     if (tx_wait_cnt < 1) begin
                         tx_wait_cnt <= tx_wait_cnt + 1;
                     end else begin
-                        uart_trigger    <= 1;
-                        uart_write_data <= custom_read_data;
-                        tx_state <= TX_IDLE;
+                        custom_data_temp <= custom_read_data;
+                        tx_state <= TX_CUSTOM_SEND;
+                    end
+                end
+
+                TX_CUSTOM_SEND: begin
+                    if (!uart_busy) begin
+                        uart_trigger     <= 1;
+                        uart_write_data  <= custom_data_temp;
+                        tx_state         <= TX_IDLE;
                     end
                 end
 
